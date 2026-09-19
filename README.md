@@ -290,6 +290,112 @@ curl -X POST http://localhost:8080/weight-summary \
 }
 ```
 
+## 按效期拣货计划 `POST /weight-pick-plan`
+
+一次提交多条扫码字符串与一组需求，按 **GTIN + 批号 + 效期** 汇总可用重量后，
+以 **FEFO（先到期先出）** 顺序为每个需求分配库存。服务地址同为
+**http://localhost:8080**，接口路径为 `POST /weight-pick-plan`。
+
+- 请求体：`{"scans": ["...", ...], "target_unit": "kg", "demands": [{"gtin": "...",
+  "quantity": 5.0}, ...]}`。`target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认
+  `"kg"`；`scans` 中的每一项既可以是元素串，也可以是 GS1 Digital Link URI
+  （与 `/parse` 完全一致）；`demands` 每项包含 `gtin`（GTIN-14，校验 Mod-10
+  校验位）与 `quantity`（目标单位下的需求重量，必须大于 0）。
+- 每条扫描必须包含**恰好一个 AI 01**、**恰好一个 AI 17**、**零个或一个 AI 10**
+  （批号可缺省）和**恰好一个重量 AI**（310n 或 320n，允许混合千克/磅）；可有可
+  无的 AI 21 会被忽略。任一条扫描解析失败或缺少/重复必需 AI，整个请求返回
+  `422`，`detail.scan_index` 给出出错下标（从 0 开始），`detail.error` 为该条
+  扫描的原始错误（结构同 `/parse`）。
+- 需求校验：**同一 GTIN 不允许出现在两个需求中**，否则返回 `422`，
+  `detail.demand_index` 给出出错的需求下标，错误码为 `DUPLICATE_GTIN`；需求
+  GTIN 本身非法（长度、字符集、校验位）同样按 `demand_index` 返回 `422`。
+- 汇总与分配：先按 **GTIN + 批号 + 效期** 汇总可用重量，再按 **AI 17 实际日期
+  升序**执行 FEFO（日字段 `00` 按 GS1 规范视为当月最后一天）；同一日到期的批次
+  保持**首次出现顺序**；每个需求的**最后一批允许部分分配**。
+- 换算、汇总、比较与分配全程使用 `Decimal` 与固定换算系数
+  （**1 lb = 0.45359237 kg**，与 `/weight-summary` 相同），仅在响应时按
+  **六位小数 half-even（银行家舍入）** 输出 JSON 数字。
+- `scans` 为空数组时返回 `200`，每个需求 `fulfilled` 为 `0.000000`、
+  `shortage` 等于全部需求量、`allocations` 为空。
+- 响应按需求顺序逐项输出：`gtin`、`quantity`（需求回显）、`fulfilled`
+  （已分配总量）、`shortage`（缺口 = quantity − fulfilled）与 `allocations`
+  （按拣货顺序列出 `{batch, expiry, quantity}`；`expiry` 为原始 AI 17 值
+  YYMMDD，无批号时 `batch` 为 `null`）。
+
+请求示例（三条扫描：B1 效期 1 月 31 日、B2 效期 2 月 28 日、B3 效期日字段
+`00` 即 2 月 28 日且为磅重；需求 12.5 kg）：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "scans": ["01095011015300031725022810B23103004000", "01095011015300031725013110B13103002513", "01095011015300031725020010B33202002513"], "demands": [{"gtin": "09501101530003", "quantity": 12.5}]}'
+```
+
+FEFO 顺序为 B1（01-31）→ B2（02-28）→ B3（`00` 视为 02-28，与 B2 同日，按
+首次出现顺序排在 B2 之后）；B3 的 25.13 lb 换算为 11.3987762581 kg，只分配
+其中 5.987 kg。响应 `200 OK`：
+
+```json
+{
+  "target_unit": "kg",
+  "demands": [
+    {
+      "gtin": "09501101530003",
+      "quantity": 12.500000,
+      "fulfilled": 12.500000,
+      "shortage": 0.000000,
+      "allocations": [
+        {"batch": "B1", "expiry": "250131", "quantity": 2.513000},
+        {"batch": "B2", "expiry": "250228", "quantity": 4.000000},
+        {"batch": "B3", "expiry": "250200", "quantity": 5.987000}
+      ]
+    }
+  ]
+}
+```
+
+库存不足时缺口体现在 `shortage`（下例仅有 4 kg 库存，需求 10 kg）：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"scans": ["01095011015300031725013110B13103004000"], "demands": [{"gtin": "09501101530003", "quantity": 10}]}'
+```
+
+```json
+{
+  "target_unit": "kg",
+  "demands": [
+    {
+      "gtin": "09501101530003",
+      "quantity": 10.000000,
+      "fulfilled": 4.000000,
+      "shortage": 6.000000,
+      "allocations": [
+        {"batch": "B1", "expiry": "250131", "quantity": 4.000000}
+      ]
+    }
+  ]
+}
+```
+
+需求出错时返回 `422`，`detail.demand_index` 指出出错的需求下标，例如重复的
+需求 GTIN：
+
+```json
+{
+  "detail": {
+    "demand_index": 1,
+    "error": {
+      "error": "DUPLICATE_GTIN",
+      "message": "demand 1: GTIN '09501101530003' is requested by more than one demand; merge the quantities into a single demand",
+      "expected": "each demand GTIN to appear at most once",
+      "found": "09501101530003"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -344,12 +450,14 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
+  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、按效期分配需求
 tests/
   test_parse.py
   test_weight_summary.py
+  test_weight_pick_plan.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
