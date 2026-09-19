@@ -290,6 +290,93 @@ curl -X POST http://localhost:8080/weight-summary \
 }
 ```
 
+## 效期优先拣货计划 `POST /weight-pick-plan`
+
+一次提交多条扫码字符串和一组按 GTIN 的需求，按 **FEFO（先到期先出）** 为每个
+需求分配净重。
+
+- 请求体：`{"scans": [...], "target_unit": "kg", "demands": [{"gtin": "...", "quantity": 5}]}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`scans` 中的每一项既可以是
+  元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每条扫描必须包含**恰好一个 AI 01**、**恰好一个 AI 17**（效期）、**零个或一个
+  AI 10**（批号可缺省）和**恰好一个重量 AI**（310n 或 320n，允许混合千克/磅）；
+  AI 21 会被忽略。任一条扫描解析失败或缺少/重复必需 AI，整个请求返回 `422`，
+  `detail.scan_index` 给出出错下标（从 0 开始），`detail.error` 为该条扫描的原始
+  错误（结构同 `/parse`）。
+- `demands` 每项含 `gtin` 与 `quantity`（`quantity` 以 `target_unit` 计，必须大于 0，
+  按 `Decimal` 精确解析，JSON number 与字符串均可）。**同一 GTIN 重复出现返回
+  `422`**，`detail.demand_index` 给出出错下标。
+- 汇总：先按 **GTIN + 批号 + AI 17 原值** 汇总可用重量（换算到 `target_unit`），
+  再对每个需求的 GTIN 按 **AI 17 实际日期升序**执行 FEFO——日字段 `00` 视为当月
+  最后一天（如 `250200` = 2025-02-28，闰年 `240200` = 2024-02-29）；实际日期相同的
+  分组保持批次**首次出现**顺序；**最后一批允许部分分配**。
+- 换算、汇总、比较与分配全程使用 `Decimal` 与固定换算系数
+  **1 lb = 0.45359237 kg**（千克→磅按其精确倒数换算），仅在响应时按**六位小数
+  half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）。
+- 响应：`target_unit` 加与请求同序的 `demands` 数组。每项含 `gtin`、`quantity`
+  （回显）、`fulfilled`（已分配总量）、`shortage`（缺口，`quantity - fulfilled`）与
+  `allocations`（按分配顺序，每条含 `batch`、`expiry`（AI 17 原值 YYMMDD）与
+  `weight`）。`scans` 为空数组时每个需求都是全额 `shortage`（`fulfilled` 为
+  `0.000000`，`allocations` 为空）。
+
+请求示例（三个批次效期不同，需求 12 kg，目标单位 kg）：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "scans": ["01095011015300031725033110LATE\u001d3103002000", "01095011015300031725013110EARLY\u001d3103002000", "01095011015300031725022810MID\u001d3202002513"], "demands": [{"gtin": "09501101530003", "quantity": 12}]}'
+```
+
+`EARLY`（2025-01-31，2 kg）最先到期全部分配，`MID`（2025-02-28，25.13 lb ≈
+11.398776 kg）部分分配 10 kg，`LATE` 不动；响应 `200 OK`：
+
+```json
+{
+  "target_unit": "kg",
+  "demands": [
+    {
+      "gtin": "09501101530003",
+      "quantity": 12.000000,
+      "fulfilled": 12.000000,
+      "shortage": 0.000000,
+      "allocations": [
+        {"batch": "EARLY", "expiry": "250131", "weight": 2.000000},
+        {"batch": "MID",   "expiry": "250228", "weight": 10.000000}
+      ]
+    }
+  ]
+}
+```
+
+库存不足时缺口计入 `shortage`（空 `scans` 即全额短缺）：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"scans": [], "demands": [{"gtin": "09501101530003", "quantity": 2.5}]}'
+```
+
+```json
+{"target_unit": "kg", "demands": [{"gtin": "09501101530003", "quantity": 2.500000, "fulfilled": 0.000000, "shortage": 2.500000, "allocations": []}]}
+```
+
+扫描错误与 `/weight-summary` 同形（`detail.scan_index` + 原始错误）；需求中 GTIN
+重复时返回 `422`：
+
+```json
+{
+  "detail": {
+    "demand_index": 1,
+    "error": {
+      "error": "DUPLICATE_GTIN",
+      "message": "demand 1: GTIN '09501101530003' is already requested by demand 0; each GTIN may appear only once",
+      "expected": "unique GTIN across all demands",
+      "found": "09501101530003"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -344,12 +431,14 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
+  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、按实际效期分配需求
 tests/
   test_parse.py
   test_weight_summary.py
+  test_weight_pick_plan.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖

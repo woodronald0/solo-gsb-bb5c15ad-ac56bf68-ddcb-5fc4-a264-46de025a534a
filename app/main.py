@@ -11,11 +11,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .gs1 import GS1ParseError, parse
+from .pickplan import DemandValidationError, pick_plan
 from .summary import WeightSummaryError, summarize
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -25,7 +26,10 @@ app = FastAPI(
         "where n is 0-9 implied decimal places followed by a fixed 6-digit "
         "value; weight elements additionally carry decimal_value and unit. "
         "POST /weight-summary aggregates the net weights of many scans, "
-        "grouped by GTIN and batch, using exact Decimal arithmetic."
+        "grouped by GTIN and batch, using exact Decimal arithmetic. "
+        "POST /weight-pick-plan aggregates scans by GTIN, batch and expiry "
+        "and fulfils per-GTIN weight demands in FEFO order (earliest AI 17 "
+        "expiry first), allowing a partial final allocation."
     ),
 )
 
@@ -119,6 +123,92 @@ class WeightSummaryResponse(BaseModel):
     groups: list[WeightGroup]
 
 
+class Demand(BaseModel):
+    gtin: str = Field(
+        ...,
+        min_length=1,
+        description="GTIN (AI 01 value) to satisfy; must be unique within one request.",
+        examples=["09501101530003"],
+    )
+    quantity: Decimal = Field(
+        ...,
+        gt=0,
+        description="Required net weight, expressed in target_unit.",
+        examples=[3.5],
+    )
+
+
+class WeightPickPlanRequest(BaseModel):
+    scans: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs, one per item. "
+            "Each must contain exactly one AI 01, exactly one AI 17 (expiry), "
+            "at most one AI 10 and exactly one weight AI 310n/320n."
+        ),
+        examples=[
+            [
+                "01095011015300031725013110B1\x1d3103002000",
+                "01095011015300031725022810B2\x1d3103002000",
+            ]
+        ],
+    )
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description=(
+            'Unit of the demand quantities and of every weight in the response: '
+            '"kg" or "lb" (default "kg").'
+        ),
+    )
+    demands: list[Demand] = Field(
+        ...,
+        description=(
+            "One demand per GTIN; quantity is expressed in target_unit. "
+            "A GTIN repeated across demands is rejected with 422."
+        ),
+        examples=[[{"gtin": "09501101530003", "quantity": 3}]],
+    )
+
+
+class Allocation(BaseModel):
+    """OpenAPI shape of one allocation; weight is rendered as an exact JSON number."""
+
+    batch: str | None = Field(
+        description="AI 10 batch/lot of the source group; null for scans without a batch"
+    )
+    expiry: str = Field(
+        description="AI 17 value (YYMMDD) of the source group, exactly as scanned"
+    )
+    weight: float = Field(
+        description=(
+            "Net weight taken from this group, in the target unit, rounded to "
+            "six decimal places with round-half-even. Computed internally with "
+            "Decimal, never float."
+        )
+    )
+
+
+class DemandPlan(BaseModel):
+    """OpenAPI shape of one fulfilled demand; weights render as exact JSON numbers."""
+
+    gtin: str = Field(description="GTIN of the demand")
+    quantity: float = Field(
+        description="Requested quantity, echoed in the target unit (six decimal places)"
+    )
+    fulfilled: float = Field(
+        description="Total weight allocated to the demand (six decimal places)"
+    )
+    shortage: float = Field(
+        description="quantity - fulfilled; 0.000000 when fully satisfied (six decimal places)"
+    )
+    allocations: list[Allocation]
+
+
+class WeightPickPlanResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    demands: list[DemandPlan]
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -160,6 +250,13 @@ def _dump(value: Any) -> str:
     raise TypeError(f"not JSON serializable: {type(value)!r}")
 
 
+def _six(value: Decimal) -> _RawNumber:
+    """Fixed-point token: ``value`` quantized half-even to six places."""
+    return _RawNumber(
+        format(value.quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN), "f")
+    )
+
+
 def _build_summary_response(result: dict) -> Response:
     """Quantize totals half-even to six places and render exact JSON."""
     payload = {
@@ -170,14 +267,34 @@ def _build_summary_response(result: dict) -> Response:
                 "batch": group["batch"],
                 "count": group["count"],
                 "unit": group["unit"],
-                "total": _RawNumber(
-                    format(
-                        group["total"].quantize(SIX_PLACES, rounding=ROUND_HALF_EVEN),
-                        "f",
-                    )
-                ),
+                "total": _six(group["total"]),
             }
             for group in result["groups"]
+        ],
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
+def _build_pick_plan_response(result: dict) -> Response:
+    """Quantize every weight half-even to six places and render exact JSON."""
+    payload = {
+        "target_unit": result["target_unit"],
+        "demands": [
+            {
+                "gtin": demand["gtin"],
+                "quantity": _six(demand["quantity"]),
+                "fulfilled": _six(demand["fulfilled"]),
+                "shortage": _six(demand["shortage"]),
+                "allocations": [
+                    {
+                        "batch": allocation["batch"],
+                        "expiry": allocation["expiry"],
+                        "weight": _six(allocation["weight"]),
+                    }
+                    for allocation in demand["allocations"]
+                ],
+            }
+            for demand in result["demands"]
         ],
     }
     return Response(content=_dump(payload), media_type="application/json")
@@ -207,3 +324,19 @@ def weight_summary(req: WeightSummaryRequest) -> Response:
     except WeightSummaryError as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_summary_response(result)
+
+
+@app.post(
+    "/weight-pick-plan",
+    response_model=WeightPickPlanResponse,
+)
+def weight_pick_plan(req: WeightPickPlanRequest) -> Response:
+    try:
+        result = pick_plan(
+            req.scans,
+            req.target_unit,
+            [(d.gtin, d.quantity) for d in req.demands],
+        )
+    except (WeightSummaryError, DemandValidationError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_pick_plan_response(result)
